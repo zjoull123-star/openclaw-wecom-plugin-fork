@@ -35,6 +35,22 @@ Recommended trust config after install:
 openclaw config set plugins.allow '["wecom-openclaw-plugin"]'
 ```
 
+## Bootstrap Skill
+
+This repo also includes a Codex skill at:
+
+```text
+skills/openclaw-wecom-bootstrap
+```
+
+Use that skill when another Codex instance needs to:
+
+- clone or update this fork
+- install or link the plugin into OpenClaw
+- apply the multi-user WeCom auto-provision config
+- optionally enable owner-only admin commands
+- validate config and restart the gateway
+
 ## Minimal Channel Setup
 
 ```sh

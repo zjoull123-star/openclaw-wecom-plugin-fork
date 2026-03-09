@@ -1,0 +1,4 @@
+interface:
+  display_name: "OpenClaw WeCom Bootstrap"
+  short_description: "Install and configure the WeCom fork"
+  default_prompt: "Use $openclaw-wecom-bootstrap to install and configure the WeCom OpenClaw fork in this environment."

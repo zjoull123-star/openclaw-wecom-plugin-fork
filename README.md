@@ -8,6 +8,8 @@ This fork adds:
 - Auto-provisioned per-user DM agents and workspaces
 - Auto-provisioned per-group agents with mention-only activation
 - Owner-only high-risk commands for `/config set`, `/config unset`, `/restart`, `/approve`, `/activation`, `!`, and `/bash`
+- WeCom-scoped media intake with `20MB` PDF/file support and `7`-day retention
+- WeCom exec approval delivery to designated admin DMs
 
 This repository is intended for Git-based installs. It is not published as a separate npm package. If you run `openclaw plugins install @wecom/wecom-openclaw-plugin`, you will get the upstream package, not this fork.
 
@@ -70,6 +72,16 @@ openclaw gateway restart
       "dmPolicy": "open",
       "allowFrom": ["*"],
       "groupPolicy": "open",
+      "media": {
+        "maxMb": 20,
+        "retentionDays": 7,
+        "storageDir": "~/.openclaw/media/wecom"
+      },
+      "approvals": {
+        "enabled": true,
+        "notifyTo": ["LiaoLiang"],
+        "dmOnly": true
+      },
       "autoProvision": {
         "enabled": true,
         "registryPath": "~/.openclaw/credentials/wecom-auto-agents.json",
@@ -89,6 +101,9 @@ openclaw gateway restart
   "commands": {
     "ownerAllowFrom": ["wecom:LiaoLiang"]
   },
+  "plugins": {
+    "allow": ["wecom-openclaw-plugin"]
+  },
   "tools": {
     "elevated": {
       "allowFrom": {
@@ -106,6 +121,8 @@ Behavior:
 - Group auto-provision only happens when the bot is mentioned.
 - `main` remains the default local CLI/App agent.
 - High-risk commands stay restricted to `commands.ownerAllowFrom`; `!` and `/bash` also require `tools.elevated.allowFrom.wecom`.
+- Inbound files are stored under `channels.wecom.media.storageDir`, pruned after `retentionDays`, and only accepted up to `maxMb`.
+- Approval requests raised by WeCom sessions are sent to `approvals.notifyTo` as DM messages, and `/approve <id> allow-once|allow-always|deny` is only accepted from those admins.
 
 ## Template Seeding
 
@@ -139,6 +156,17 @@ openclaw plugins install /absolute/path/to/openclaw-wecom-plugin-fork
 openclaw gateway restart
 ```
 
-## Known Limitation
+## Approval Flow
 
-This fork does not yet add a WeCom-native exec approval notification flow. If a conversation triggers host execution that requires approval, the session can block waiting for approval. For production use, keep that risk in mind when enabling elevated tools for general chat users.
+When a WeCom session triggers an exec approval:
+
+- the request is mirrored to `channels.wecom.approvals.notifyTo` over DM
+- the approver responds with `/approve <id> allow-once`, `/approve <id> allow-always`, or `/approve <id> deny`
+- only the configured owner/admin users can resolve approvals
+
+`/approve` is intentionally DM-only by default.
+
+## Known Limitations
+
+- Approval delivery depends on the gateway CLI being available to the plugin runtime for `openclaw gateway call exec.approval.resolve`.
+- This fork is maintained from packaged `dist/` artifacts rather than the upstream source tree.

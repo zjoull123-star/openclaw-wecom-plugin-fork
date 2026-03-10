@@ -34,6 +34,27 @@
         "type": "object",
         "additionalProperties": true
       },
+      "media": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "maxMb": { "type": "number" },
+          "retentionDays": { "type": "number" },
+          "storageDir": { "type": "string" }
+        }
+      },
+      "approvals": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "notifyTo": {
+            "type": "array",
+            "items": { "type": ["string", "number"] }
+          },
+          "dmOnly": { "type": "boolean" }
+        }
+      },
       "autoProvision": {
         "type": "object",
         "additionalProperties": true,

@@ -75,7 +75,13 @@ const MEDIA_DOCUMENT_PLACEHOLDER = "<media:document>";
 // 默认值
 // ============================================================================
 /** 默认媒体大小上限（MB） */
-const DEFAULT_MEDIA_MAX_MB = 5;
+const DEFAULT_MEDIA_MAX_MB = 20;
+/** 默认媒体保留时长（天） */
+const DEFAULT_MEDIA_RETENTION_DAYS = 7;
+/** 默认媒体存储子目录 */
+const DEFAULT_MEDIA_STORAGE_SUBDIR = CHANNEL_ID;
+/** 默认审批处理超时（毫秒） */
+const DEFAULT_APPROVAL_RESOLVE_TIMEOUT_MS = 15000;
 /** 文本分块大小上限 */
 const TEXT_CHUNK_LIMIT = 4000;
 const AUTO_PROVISION_REGISTRY_VERSION = 1;
@@ -89,6 +95,11 @@ const DEFAULT_AUTO_PROVISION_GROUP_WORKSPACE_ROOT = "~/.openclaw/workspace-wecom
 const DEFAULT_GROUP_MENTION_NAME = "openclaw";
 const TEMPLATE_SEED_ENTRIES = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md", "USER.md", "skills"];
 const autoProvisionInflight = new Map();
+const transcriptReadOffsets = new Map();
+const pendingApprovals = new Map();
+const APPROVAL_DECISIONS = new Set(["allow-once", "allow-always", "deny"]);
+const SENSITIVE_KEY_RE = /(secret|token|api[-_]?key|authorization|password)/i;
+let approvalTranscriptWatcherStop = null;
 function expandUserPath(value) {
     const raw = String(value ?? "").trim();
     if (!raw) {
@@ -105,6 +116,465 @@ function expandUserPath(value) {
 function normalizeStringEntry(value) {
     const trimmed = String(value ?? "").trim();
     return trimmed ? trimmed : undefined;
+}
+function isPathInside(parentPath, targetPath) {
+    const resolvedParent = path.resolve(parentPath);
+    const resolvedTarget = path.resolve(targetPath);
+    return resolvedTarget === resolvedParent || resolvedTarget.startsWith(resolvedParent + path.sep);
+}
+function sanitizeFileName(value) {
+    const normalized = path.basename(String(value ?? "").trim() || "attachment");
+    const cleaned = normalized.replace(/[^a-zA-Z0-9._-]+/g, "_").replace(/^_+|_+$/g, "");
+    return cleaned || "attachment";
+}
+function truncateForLog(value, maxLength = 240) {
+    const text = String(value ?? "");
+    return text.length > maxLength ? text.slice(0, Math.max(0, maxLength - 1)) + "…" : text;
+}
+function sanitizeForLog(value, depth = 0) {
+    if (value === null || value === undefined) {
+        return value;
+    }
+    if (depth >= 4) {
+        return "[depth-truncated]";
+    }
+    if (typeof value === "string") {
+        return truncateForLog(value);
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+        return value;
+    }
+    if (Array.isArray(value)) {
+        return value.slice(0, 12).map((entry) => sanitizeForLog(entry, depth + 1));
+    }
+    if (typeof value === "object") {
+        const out = {};
+        for (const [key, entry] of Object.entries(value)) {
+            out[key] = SENSITIVE_KEY_RE.test(key) ? "[redacted]" : sanitizeForLog(entry, depth + 1);
+        }
+        return out;
+    }
+    return String(value);
+}
+function logWeCom(runtime, message, meta) {
+    if (!runtime?.log) {
+        return;
+    }
+    if (meta === undefined) {
+        runtime.log(`[WeCom] ${message}`);
+        return;
+    }
+    runtime.log(`[WeCom] ${message}: ${JSON.stringify(sanitizeForLog(meta))}`);
+}
+function logWeComError(runtime, message, meta) {
+    if (!runtime?.error) {
+        return;
+    }
+    if (meta === undefined) {
+        runtime.error(`[WeCom] ${message}`);
+        return;
+    }
+    runtime.error(`[WeCom] ${message}: ${JSON.stringify(sanitizeForLog(meta))}`);
+}
+function resolveMediaRootDir() {
+    return path.join(getWeComRuntime().state.resolveStateDir(), "media");
+}
+function resolveWeComMediaConfig(cfg, runtime) {
+    const raw = cfg.channels?.[CHANNEL_ID]?.media ?? {};
+    const mediaRoot = resolveMediaRootDir();
+    const storageDirRaw = normalizeStringEntry(raw.storageDir) ?? path.join(mediaRoot, DEFAULT_MEDIA_STORAGE_SUBDIR);
+    let storageDir = expandUserPath(storageDirRaw);
+    if (!path.isAbsolute(storageDir)) {
+        storageDir = path.join(mediaRoot, storageDir);
+    }
+    if (!isPathInside(mediaRoot, storageDir)) {
+        logWeCom(runtime, "Media storage dir outside OpenClaw media root; falling back to default", {
+            requested: storageDir,
+            mediaRoot,
+        });
+        storageDir = path.join(mediaRoot, DEFAULT_MEDIA_STORAGE_SUBDIR);
+    }
+    const rawMaxMb = typeof raw.maxMb === "number" && Number.isFinite(raw.maxMb) ? raw.maxMb : undefined;
+    const rawRetention = typeof raw.retentionDays === "number" && Number.isFinite(raw.retentionDays) ? raw.retentionDays : undefined;
+    return {
+        maxMb: rawMaxMb && rawMaxMb > 0 ? rawMaxMb : DEFAULT_MEDIA_MAX_MB,
+        retentionDays: rawRetention && rawRetention > 0 ? rawRetention : DEFAULT_MEDIA_RETENTION_DAYS,
+        storageDir,
+        mediaRoot,
+    };
+}
+function pruneWeComMediaStorage(cfg, runtime) {
+    const mediaConfig = resolveWeComMediaConfig(cfg, runtime);
+    ensureDir(mediaConfig.storageDir);
+    const cutoffMs = Date.now() - mediaConfig.retentionDays * 24 * 60 * 60 * 1000;
+    const walk = (targetDir) => {
+        if (!pathExists(targetDir)) {
+            return;
+        }
+        for (const entry of fs.readdirSync(targetDir, { withFileTypes: true })) {
+            const entryPath = path.join(targetDir, entry.name);
+            try {
+                if (entry.isDirectory()) {
+                    walk(entryPath);
+                    if (fs.readdirSync(entryPath).length === 0) {
+                        fs.rmdirSync(entryPath);
+                    }
+                    continue;
+                }
+                const stat = fs.statSync(entryPath);
+                if (stat.mtimeMs < cutoffMs) {
+                    fs.rmSync(entryPath, { force: true });
+                }
+            }
+            catch (err) {
+                logWeCom(runtime, "Failed to prune media entry", { path: entryPath, error: String(err) });
+            }
+        }
+    };
+    walk(mediaConfig.storageDir);
+}
+function createWeComMediaError(code, message, details) {
+    const error = new Error(message);
+    error.code = code;
+    error.details = details;
+    return error;
+}
+function formatSizeMb(bytes) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+function guessExtension(contentType, originalFilename) {
+    const knownExt = path.extname(String(originalFilename ?? "").trim());
+    if (knownExt) {
+        return knownExt.toLowerCase();
+    }
+    switch (contentType) {
+        case "application/pdf":
+            return ".pdf";
+        case "image/png":
+            return ".png";
+        case "image/jpeg":
+            return ".jpg";
+        case "image/webp":
+            return ".webp";
+        case "image/gif":
+            return ".gif";
+        default:
+            return "";
+    }
+}
+async function saveInboundMediaBuffer(params) {
+    const { buffer, contentType, originalFilename, cfg, runtime, kind } = params;
+    const mediaConfig = resolveWeComMediaConfig(cfg, runtime);
+    ensureDir(mediaConfig.storageDir);
+    const maxBytes = mediaConfig.maxMb * 1024 * 1024;
+    if (buffer.length > maxBytes) {
+        throw createWeComMediaError("too-large", `Media exceeds ${mediaConfig.maxMb}MB limit`, {
+            sizeBytes: buffer.length,
+            maxBytes,
+            originalFilename,
+            kind,
+        });
+    }
+    const safeName = sanitizeFileName(originalFilename ?? kind);
+    const parsed = path.parse(safeName);
+    const ext = guessExtension(contentType, originalFilename);
+    const basename = sanitizeFileName(parsed.name || "attachment");
+    const fileStem = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}-${basename}`;
+    const filePath = path.join(mediaConfig.storageDir, `${fileStem}${ext || parsed.ext || ""}`);
+    const metadataPath = `${filePath}.json`;
+    const digest = crypto.createHash("sha256").update(buffer).digest("hex");
+    const metadata = {
+        sha256: digest,
+        sizeBytes: buffer.length,
+        contentType,
+        originalFilename: originalFilename ?? null,
+        storedAt: new Date().toISOString(),
+        kind,
+        channel: CHANNEL_ID,
+    };
+    fs.writeFileSync(filePath, buffer, { mode: 0o600 });
+    fs.writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, { mode: 0o600 });
+    return {
+        path: filePath,
+        contentType,
+        metadata,
+    };
+}
+function buildFileFailureNotice(originalFilename, error, cfg, runtime) {
+    const mediaConfig = resolveWeComMediaConfig(cfg, runtime);
+    const name = sanitizeFileName(originalFilename ?? "附件");
+    if (error?.code === "too-large") {
+        const sizeBytes = Number(error?.details?.sizeBytes ?? 0);
+        return `已收到文件“${name}”，但大小为 ${formatSizeMb(sizeBytes)}，超过 ${mediaConfig.maxMb}MB 上限，未处理。`;
+    }
+    return `已收到文件“${name}”，但读取失败，未处理。`;
+}
+function resolveWeComApprovalConfig(cfg) {
+    const raw = cfg.channels?.[CHANNEL_ID]?.approvals ?? {};
+    const fallbackApprovers = resolveOwnerAllowFrom(cfg).map((entry) => normalizeOwnerEntry(entry)).filter(Boolean);
+    const notifyTo = Array.isArray(raw.notifyTo)
+        ? raw.notifyTo.map((entry) => normalizeOwnerEntry(String(entry))).filter(Boolean)
+        : fallbackApprovers;
+    return {
+        enabled: raw.enabled !== false,
+        notifyTo,
+        dmOnly: raw.dmOnly !== false,
+    };
+}
+function parseWeComApprovalCommand(text) {
+    const trimmed = String(text ?? "").trim();
+    const match = trimmed.match(/^\/approve(?:\s+([A-Za-z0-9-]+)(?:\s+(allow-once|allow-always|deny))?)?\s*$/i);
+    if (!match) {
+        return undefined;
+    }
+    return {
+        id: match[1] ? match[1].trim() : "",
+        decision: match[2] ? match[2].toLowerCase() : "",
+    };
+}
+function loadSessionStoreEntryForTranscript(sessionFile) {
+    const storePath = path.join(path.dirname(sessionFile), "sessions.json");
+    if (!pathExists(storePath)) {
+        return undefined;
+    }
+    try {
+        const parsed = JSON.parse(fs.readFileSync(storePath, "utf8"));
+        for (const [sessionKey, entry] of Object.entries(parsed ?? {})) {
+            if (entry && typeof entry === "object" && entry.sessionFile === sessionFile) {
+                return {
+                    sessionKey,
+                    entry,
+                    storePath,
+                };
+            }
+        }
+    }
+    catch (err) {
+        logWeCom(runtime, "Failed to read session store for transcript", { sessionFile, error: String(err) });
+    }
+    return undefined;
+}
+function readTranscriptEntriesSinceLastOffset(sessionFile) {
+    const stat = fs.statSync(sessionFile);
+    const existing = transcriptReadOffsets.get(sessionFile) ?? { offset: 0, remainder: "" };
+    const startOffset = existing.offset <= stat.size ? existing.offset : 0;
+    const bytesToRead = stat.size - startOffset;
+    const fd = fs.openSync(sessionFile, "r");
+    try {
+        const chunk = bytesToRead > 0 ? Buffer.alloc(bytesToRead) : Buffer.alloc(0);
+        if (bytesToRead > 0) {
+            fs.readSync(fd, chunk, 0, bytesToRead, startOffset);
+        }
+        const merged = `${startOffset === 0 ? "" : existing.remainder}${chunk.toString("utf8")}`;
+        const lines = merged.split(/\r?\n/);
+        const remainder = lines.pop() ?? "";
+        transcriptReadOffsets.set(sessionFile, { offset: stat.size, remainder });
+        return lines.map((line) => {
+            const trimmed = line.trim();
+            if (!trimmed) {
+                return undefined;
+            }
+            try {
+                return JSON.parse(trimmed);
+            }
+            catch {
+                return undefined;
+            }
+        }).filter(Boolean);
+    }
+    finally {
+        fs.closeSync(fd);
+    }
+}
+async function sendApprovalNotificationToApprovers(params) {
+    const { approval, cfg, runtime } = params;
+    const approvalConfig = resolveWeComApprovalConfig(cfg);
+    if (!approvalConfig.enabled || approvalConfig.notifyTo.length === 0) {
+        return;
+    }
+    const commandPreview = truncateForLog(approval.command, 600);
+    const requester = approval.deliveryContext?.to ?? approval.sessionKey;
+    const content = [
+        "Exec approval required",
+        `Request ID: ${approval.slug}`,
+        `Requester: ${requester}`,
+        `Session: ${approval.sessionKey}`,
+        approval.cwd ? `CWD: ${approval.cwd}` : undefined,
+        `Command: ${commandPreview}`,
+        "",
+        `Reply with: /approve ${approval.slug} allow-once`,
+        `Or: /approve ${approval.slug} allow-always`,
+        `Or: /approve ${approval.slug} deny`,
+    ].filter(Boolean).join("\n");
+    for (const approver of approvalConfig.notifyTo) {
+        try {
+            await sendWeComMessage({
+                to: `${CHANNEL_ID}:${approver}`,
+                content,
+                accountId: approval.accountId,
+            });
+        }
+        catch (err) {
+            logWeComError(runtime, "Failed to send approval notification", {
+                approver,
+                approvalId: approval.id,
+                error: String(err),
+            });
+        }
+    }
+}
+async function notifyApprovalRequester(approval, content) {
+    if (!approval?.deliveryContext?.to) {
+        return;
+    }
+    try {
+        await sendWeComMessage({
+            to: approval.deliveryContext.to,
+            content,
+            accountId: approval.accountId,
+        });
+    }
+    catch (err) {
+        logWeComError(runtime, "Failed to notify approval requester", {
+            approvalId: approval?.id,
+            to: approval?.deliveryContext?.to,
+            error: String(err),
+        });
+    }
+}
+function clearPendingApproval(approvalId) {
+    const pending = pendingApprovals.get(approvalId);
+    if (pending?.timeoutHandle) {
+        clearTimeout(pending.timeoutHandle);
+    }
+    pendingApprovals.delete(approvalId);
+    return pending;
+}
+async function handlePendingApprovalExpiry(approvalId) {
+    const pending = clearPendingApproval(approvalId);
+    if (!pending) {
+        return;
+    }
+    await notifyApprovalRequester(pending, `执行审批已超时，未运行。\nRequest ID: ${pending.slug}`);
+}
+async function handleApprovalTranscriptEntry(transcriptEntry, sessionInfo, cfg, runtime) {
+    const message = transcriptEntry?.message;
+    const details = message?.details;
+    const approvalId = String(details?.approvalId ?? "").trim();
+    if (!approvalId || pendingApprovals.has(approvalId)) {
+        return;
+    }
+    const expiresAtMs = Number(details?.expiresAtMs ?? 0);
+    if (!Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+        return;
+    }
+    const approval = {
+        id: approvalId,
+        slug: String(details?.approvalSlug ?? approvalId.slice(0, 8)),
+        expiresAtMs,
+        command: String(details?.command ?? ""),
+        cwd: normalizeStringEntry(details?.cwd),
+        sessionKey: sessionInfo.sessionKey,
+        deliveryContext: sessionInfo.entry?.deliveryContext,
+        accountId: String(sessionInfo.entry?.deliveryContext?.accountId ?? DEFAULT_ACCOUNT_ID),
+        timeoutHandle: setTimeout(() => {
+            void handlePendingApprovalExpiry(approvalId);
+        }, Math.max(0, expiresAtMs - Date.now())),
+    };
+    pendingApprovals.set(approvalId, approval);
+    await sendApprovalNotificationToApprovers({ approval, cfg, runtime });
+}
+async function handleTranscriptUpdate(sessionFile) {
+    if (!pathExists(sessionFile)) {
+        return;
+    }
+    const cfg = await getWeComRuntime().config.loadConfig();
+    const approvalConfig = resolveWeComApprovalConfig(cfg);
+    if (!approvalConfig.enabled) {
+        return;
+    }
+    const sessionInfo = loadSessionStoreEntryForTranscript(sessionFile);
+    if (!sessionInfo || sessionInfo.entry?.deliveryContext?.channel !== CHANNEL_ID) {
+        return;
+    }
+    const entries = readTranscriptEntriesSinceLastOffset(sessionFile);
+    for (const entry of entries) {
+        if (entry?.type !== "message") {
+            continue;
+        }
+        const message = entry.message;
+        if (message?.role === "toolResult" &&
+            message?.toolName === "exec" &&
+            message?.details?.status === "approval-pending") {
+            await handleApprovalTranscriptEntry(entry, sessionInfo, cfg, runtime);
+            continue;
+        }
+        if (message?.role === "user" && typeof message?.content?.[0]?.text === "string") {
+            const text = message.content[0].text;
+            const timeoutMatch = text.match(/approval-timeout\):/i);
+            const idMatch = text.match(/gateway id=([a-f0-9-]{8,})/i);
+            if (timeoutMatch && idMatch) {
+                clearPendingApproval(idMatch[1]);
+            }
+        }
+    }
+}
+function ensureApprovalWatcherStarted() {
+    if (approvalTranscriptWatcherStop) {
+        return;
+    }
+    approvalTranscriptWatcherStop = getWeComRuntime().events.onSessionTranscriptUpdate((update) => {
+        void handleTranscriptUpdate(update.sessionFile).catch((err) => {
+            logWeComError(runtime, "Approval transcript watcher failed", { error: String(err), sessionFile: update.sessionFile });
+        });
+    });
+}
+async function primeApprovalWatcher(cfg, runtime) {
+    ensureApprovalWatcherStarted();
+    const wecomAgentIds = new Set((cfg.bindings ?? [])
+        .filter((binding) => binding?.match?.channel === CHANNEL_ID && binding?.agentId)
+        .map((binding) => String(binding.agentId)));
+    for (const agent of cfg.agents?.list ?? []) {
+        const agentId = String(agent?.id ?? "");
+        if (!agentId || (!wecomAgentIds.has(agentId) && !agentId.startsWith("wecom-"))) {
+            continue;
+        }
+        const sessionsDir = path.join(expandUserPath(agent.agentDir ?? ""), "..", "sessions");
+        const storePath = path.join(sessionsDir, "sessions.json");
+        if (!pathExists(storePath)) {
+            continue;
+        }
+        try {
+            const store = JSON.parse(fs.readFileSync(storePath, "utf8"));
+            for (const entry of Object.values(store ?? {})) {
+                const sessionFile = entry?.sessionFile;
+                if (typeof sessionFile === "string" && pathExists(sessionFile)) {
+                    await handleTranscriptUpdate(sessionFile);
+                }
+            }
+        }
+        catch (err) {
+            logWeCom(runtime, "Failed to prime approval watcher", { agentId, error: String(err) });
+        }
+    }
+}
+async function resolveApprovalViaGateway(approvalId, decision, runtime) {
+    const command = [
+        "openclaw",
+        "gateway",
+        "call",
+        "exec.approval.resolve",
+        "--json",
+        "--params",
+        JSON.stringify({ id: approvalId, decision }),
+    ];
+    const result = await getWeComRuntime().system.runCommandWithTimeout(command, {
+        timeoutMs: DEFAULT_APPROVAL_RESOLVE_TIMEOUT_MS,
+    });
+    if (result.code !== 0) {
+        throw new Error(result.stderr.trim() || result.stdout.trim() || `gateway call failed with code ${String(result.code)}`);
+    }
+    logWeCom(runtime, "Resolved approval via gateway", { approvalId, decision });
 }
 function pathExists(targetPath) {
     if (!targetPath) {
@@ -1028,11 +1498,10 @@ async function downloadAndSaveImages(params) {
     const { imageUrls, config, runtime, wsClient } = params;
     const core = getWeComRuntime();
     const mediaList = [];
+    const notices = [];
     for (const imageUrl of imageUrls) {
         try {
-            runtime.log?.(`[WeCom] Downloading image from: ${imageUrl}`);
-            const mediaMaxMb = config.agents?.defaults?.mediaMaxMb ?? DEFAULT_MEDIA_MAX_MB;
-            const maxBytes = mediaMaxMb * 1024 * 1024;
+            logWeCom(runtime, "Downloading image", { imageUrl });
             let imageBuffer;
             let imageContentType;
             let originalFilename;
@@ -1043,29 +1512,53 @@ async function downloadAndSaveImages(params) {
                 imageBuffer = result.buffer;
                 originalFilename = result.filename;
                 imageContentType = await detectImageContentType(imageBuffer);
-                runtime.log?.(`[WeCom] Image downloaded via SDK: size=${imageBuffer.length}, contentType=${imageContentType}${originalFilename ? `, filename=${originalFilename}` : ""}`);
+                logWeCom(runtime, "Image downloaded via SDK", {
+                    imageUrl,
+                    sizeBytes: imageBuffer.length,
+                    contentType: imageContentType,
+                    filename: originalFilename,
+                });
             }
             catch (sdkError) {
-                // 如果 SDK 方法失败，回退到原有方式（带超时保护）
-                runtime.log?.(`[WeCom] SDK download failed, falling back to manual download: ${String(sdkError)}`);
+                logWeCom(runtime, "Image SDK download failed; falling back to manual fetch", {
+                    imageUrl,
+                    error: String(sdkError),
+                });
                 const fetched = await withTimeout(core.channel.media.fetchRemoteMedia({ url: imageUrl }), IMAGE_DOWNLOAD_TIMEOUT_MS, `Manual image download timed out: ${imageUrl}`);
-                runtime.log?.(`[WeCom] Image fetched: contentType=${fetched.contentType}, size=${fetched.buffer.length}, first4Bytes=${fetched.buffer.slice(0, 4).toString("hex")}`);
                 imageBuffer = fetched.buffer;
                 imageContentType = fetched.contentType ?? "application/octet-stream";
                 const isValidImage = await isImageBuffer(fetched.buffer);
                 if (!isValidImage) {
-                    runtime.log?.(`[WeCom] WARN: Image does not appear to be a valid image format`);
+                    logWeCom(runtime, "Image payload does not look like a standard image", {
+                        imageUrl,
+                        contentType: imageContentType,
+                    });
                 }
             }
-            const saved = await core.channel.media.saveMediaBuffer(imageBuffer, imageContentType, "inbound", maxBytes, originalFilename);
+            const saved = await saveInboundMediaBuffer({
+                buffer: imageBuffer,
+                contentType: imageContentType,
+                originalFilename,
+                cfg: config,
+                runtime,
+                kind: "image",
+            });
             mediaList.push({ path: saved.path, contentType: saved.contentType });
-            runtime.log?.(`[WeCom] Image saved to ${saved.path}, finalContentType=${saved.contentType}`);
+            logWeCom(runtime, "Image saved", {
+                imageUrl,
+                path: saved.path,
+                contentType: saved.contentType,
+            });
         }
         catch (err) {
-            runtime.error?.(`[WeCom] Failed to download image: ${String(err)}`);
+            const message = err?.code === "too-large"
+                ? `已收到图片，但大小超过 ${resolveWeComMediaConfig(config, runtime).maxMb}MB 上限，未处理。`
+                : "已收到图片，但读取失败，未处理。";
+            notices.push(message);
+            logWeComError(runtime, "Failed to download image", { imageUrl, error: String(err) });
         }
     }
-    return mediaList;
+    return { mediaList, notices };
 }
 /**
  * 下载并保存所有文件到本地，每个文件的下载带超时保护
@@ -1074,42 +1567,59 @@ async function downloadAndSaveFiles(params) {
     const { fileUrls, config, runtime, wsClient } = params;
     const core = getWeComRuntime();
     const mediaList = [];
+    const notices = [];
     for (const fileUrl of fileUrls) {
+        let originalFilename;
         try {
-            runtime.log?.(`[WeCom] Downloading file from: ${fileUrl}`);
-            const mediaMaxMb = config.agents?.defaults?.mediaMaxMb ?? DEFAULT_MEDIA_MAX_MB;
-            const maxBytes = mediaMaxMb * 1024 * 1024;
+            logWeCom(runtime, "Downloading file", { fileUrl });
             let fileBuffer;
             let fileContentType;
-            let originalFilename;
             const fileAesKey = params.fileAesKeys?.get(fileUrl);
             try {
                 // 使用 SDK 的 downloadFile 方法下载（带超时保护）
                 const result = await withTimeout(wsClient.downloadFile(fileUrl, fileAesKey), FILE_DOWNLOAD_TIMEOUT_MS, `File download timed out: ${fileUrl}`);
                 fileBuffer = result.buffer;
                 originalFilename = result.filename;
-                // 检测文件类型
                 const type = await fileTypeFromBuffer(fileBuffer);
                 fileContentType = type?.mime ?? "application/octet-stream";
-                runtime.log?.(`[WeCom] File downloaded via SDK: size=${fileBuffer.length}, contentType=${fileContentType}${originalFilename ? `, filename=${originalFilename}` : ""}`);
+                logWeCom(runtime, "File downloaded via SDK", {
+                    fileUrl,
+                    sizeBytes: fileBuffer.length,
+                    contentType: fileContentType,
+                    filename: originalFilename,
+                });
             }
             catch (sdkError) {
-                // 如果 SDK 方法失败，回退到 fetchRemoteMedia（带超时保护）
-                runtime.log?.(`[WeCom] SDK file download failed, falling back to manual download: ${String(sdkError)}`);
+                logWeCom(runtime, "File SDK download failed; falling back to manual fetch", {
+                    fileUrl,
+                    error: String(sdkError),
+                });
                 const fetched = await withTimeout(core.channel.media.fetchRemoteMedia({ url: fileUrl }), FILE_DOWNLOAD_TIMEOUT_MS, `Manual file download timed out: ${fileUrl}`);
-                runtime.log?.(`[WeCom] File fetched: contentType=${fetched.contentType}, size=${fetched.buffer.length}`);
                 fileBuffer = fetched.buffer;
                 fileContentType = fetched.contentType ?? "application/octet-stream";
+                originalFilename = originalFilename ?? path.basename(new URL(fileUrl).pathname || "document");
             }
-            const saved = await core.channel.media.saveMediaBuffer(fileBuffer, fileContentType, "inbound", maxBytes, originalFilename);
+            const saved = await saveInboundMediaBuffer({
+                buffer: fileBuffer,
+                contentType: fileContentType,
+                originalFilename,
+                cfg: config,
+                runtime,
+                kind: "file",
+            });
             mediaList.push({ path: saved.path, contentType: saved.contentType });
-            runtime.log?.(`[WeCom] File saved to ${saved.path}, finalContentType=${saved.contentType}`);
+            logWeCom(runtime, "File saved", {
+                fileUrl,
+                path: saved.path,
+                contentType: saved.contentType,
+            });
         }
         catch (err) {
-            runtime.error?.(`[WeCom] Failed to download file: ${String(err)}`);
+            notices.push(buildFileFailureNotice(originalFilename, err, config, runtime));
+            logWeComError(runtime, "Failed to download file", { fileUrl, error: String(err) });
         }
     }
-    return mediaList;
+    return { mediaList, notices };
 }
 
 /**
@@ -1864,6 +2374,115 @@ async function routeAndDispatchMessage(params) {
         safeCleanup();
     }
 }
+function resolvePendingApprovalByInput(input) {
+    const normalized = String(input ?? "").trim().toLowerCase();
+    if (!normalized) {
+        return undefined;
+    }
+    for (const approval of pendingApprovals.values()) {
+        if (approval.id.toLowerCase() === normalized || approval.slug.toLowerCase() === normalized) {
+            return approval;
+        }
+    }
+    return undefined;
+}
+function formatPendingApprovalsSummary() {
+    const rows = [...pendingApprovals.values()]
+        .sort((a, b) => a.expiresAtMs - b.expiresAtMs)
+        .slice(0, 10)
+        .map((approval) => `- ${approval.slug} -> ${approval.deliveryContext?.to ?? approval.sessionKey}`);
+    return rows.length > 0 ? rows.join("\n") : "当前没有待审批的执行请求。";
+}
+async function maybeHandleWeComApprovalCommand(params) {
+    const parsed = parseWeComApprovalCommand(params.text);
+    if (!parsed) {
+        return false;
+    }
+    const approvalConfig = resolveWeComApprovalConfig(params.cfg);
+    if (!approvalConfig.enabled) {
+        await sendWeComReply({
+            wsClient: params.wsClient,
+            frame: params.frame,
+            text: "执行审批当前未启用。",
+            runtime: params.runtime,
+        });
+        return true;
+    }
+    if (!params.commandAccess.senderIsOwner) {
+        await sendWeComReply({
+            wsClient: params.wsClient,
+            frame: params.frame,
+            text: "只有管理员可以审批执行请求。",
+            runtime: params.runtime,
+        });
+        return true;
+    }
+    if (approvalConfig.dmOnly && params.chatType !== "direct") {
+        await sendWeComReply({
+            wsClient: params.wsClient,
+            frame: params.frame,
+            text: "执行审批只能在管理员私聊中完成。",
+            runtime: params.runtime,
+        });
+        return true;
+    }
+    if (!parsed.id || !parsed.decision) {
+        await sendWeComReply({
+            wsClient: params.wsClient,
+            frame: params.frame,
+            text: ["用法: /approve <id> allow-once|allow-always|deny", "", formatPendingApprovalsSummary()].join("\n"),
+            runtime: params.runtime,
+        });
+        return true;
+    }
+    if (!APPROVAL_DECISIONS.has(parsed.decision)) {
+        await sendWeComReply({
+            wsClient: params.wsClient,
+            frame: params.frame,
+            text: "无效审批动作。可用值: allow-once, allow-always, deny。",
+            runtime: params.runtime,
+        });
+        return true;
+    }
+    const pending = resolvePendingApprovalByInput(parsed.id);
+    if (!pending) {
+        await sendWeComReply({
+            wsClient: params.wsClient,
+            frame: params.frame,
+            text: `未找到待审批请求: ${parsed.id}`,
+            runtime: params.runtime,
+        });
+        return true;
+    }
+    try {
+        await resolveApprovalViaGateway(pending.id, parsed.decision, params.runtime);
+        clearPendingApproval(pending.id);
+        const requesterText = parsed.decision === "deny"
+            ? `执行审批已拒绝。\nRequest ID: ${pending.slug}`
+            : `执行审批已批准，命令继续运行。\nRequest ID: ${pending.slug}`;
+        await notifyApprovalRequester(pending, requesterText);
+        await sendWeComReply({
+            wsClient: params.wsClient,
+            frame: params.frame,
+            text: `审批已提交: ${pending.slug} -> ${parsed.decision}`,
+            runtime: params.runtime,
+        });
+    }
+    catch (err) {
+        logWeComError(params.runtime, "Failed to resolve approval", {
+            approvalId: pending.id,
+            decision: parsed.decision,
+            error: String(err),
+        });
+        await sendWeComReply({
+            wsClient: params.wsClient,
+            frame: params.frame,
+            text: `审批提交失败: ${pending.slug}\n${truncateForLog(String(err), 400)}`,
+            runtime: params.runtime,
+        });
+    }
+    return true;
+}
 /**
  * 处理企业微信消息（主函数）
  *
@@ -1942,6 +2561,22 @@ async function processWeComMessage(params) {
     if (!dmPolicyResult.allowed) {
         return effectiveConfig;
     }
+    const preflightCommandAccess = resolveWeComCommandAccess({
+        cfg: effectiveConfig,
+        text,
+        senderId: body.from.userid,
+    });
+    if (await maybeHandleWeComApprovalCommand({
+        text,
+        cfg: effectiveConfig,
+        runtime,
+        wsClient,
+        frame,
+        chatType,
+        commandAccess: preflightCommandAccess,
+    })) {
+        return effectiveConfig;
+    }
     const autoProvision = resolveAutoProvisionConfig(effectiveConfig);
     if (autoProvision.enabled) {
         if (chatType === "group") {
@@ -1975,7 +2610,7 @@ async function processWeComMessage(params) {
         }
     }
     // Step 4: 下载并保存图片和文件
-    const [imageMediaList, fileMediaList] = await Promise.all([
+    const [imageResult, fileResult] = await Promise.all([
         downloadAndSaveImages({
             imageUrls,
             imageAesKeys,
@@ -1993,7 +2628,20 @@ async function processWeComMessage(params) {
             wsClient,
         }),
     ]);
-    const mediaList = [...imageMediaList, ...fileMediaList];
+    const mediaList = [...imageResult.mediaList, ...fileResult.mediaList];
+    const mediaNotices = [...imageResult.notices, ...fileResult.notices];
+    if (mediaNotices.length > 0 && !text && mediaList.length === 0) {
+        await sendWeComReply({
+            wsClient,
+            frame,
+            text: mediaNotices.join("\n\n"),
+            runtime,
+        });
+        return effectiveConfig;
+    }
+    if (mediaNotices.length > 0) {
+        text = [text, mediaNotices.join("\n\n")].filter(Boolean).join("\n\n");
+    }
     // Step 5: 初始化消息状态
     setReqIdForChat(chatId, reqId, effectiveAccount.accountId);
     const streamId = generateReqId("stream");
@@ -2054,16 +2702,16 @@ async function processWeComMessage(params) {
 function createSdkLogger(runtime, accountId) {
     return {
         debug: (message, ...args) => {
-            runtime.log?.(`[${accountId}] ${message}`, ...args);
+            runtime.log?.(`[${accountId}] ${message}`, sanitizeForLog(args));
         },
         info: (message, ...args) => {
-            runtime.log?.(`[${accountId}] ${message}`, ...args);
+            runtime.log?.(`[${accountId}] ${message}`, sanitizeForLog(args));
         },
         warn: (message, ...args) => {
-            runtime.log?.(`[${accountId}] WARN: ${message}`, ...args);
+            runtime.log?.(`[${accountId}] WARN: ${message}`, sanitizeForLog(args));
         },
         error: (message, ...args) => {
-            runtime.error?.(`[${accountId}] ${message}`, ...args);
+            runtime.error?.(`[${accountId}] ${message}`, sanitizeForLog(args));
         },
     };
 }
@@ -2197,6 +2845,29 @@ const wecomPluginConfigSchema = {
             type: "object",
             additionalProperties: true,
         },
+        media: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+                maxMb: { type: "number" },
+                retentionDays: { type: "number" },
+                storageDir: { type: "string" },
+            },
+        },
+        approvals: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+                enabled: { type: "boolean" },
+                notifyTo: {
+                    type: "array",
+                    items: {
+                        type: ["string", "number"],
+                    },
+                },
+                dmOnly: { type: "boolean" },
+            },
+        },
         autoProvision: {
             type: "object",
             additionalProperties: true,
@@ -2255,6 +2926,8 @@ function setWeComAccount(cfg, account) {
         groupPolicy: account.groupPolicy ?? existing?.groupPolicy,
         groupAllowFrom: account.groupAllowFrom ?? existing?.groupAllowFrom,
         configWrites: account.configWrites ?? existing?.configWrites,
+        media: account.media ?? existing?.media,
+        approvals: account.approvals ?? existing?.approvals,
         autoProvision: account.autoProvision ?? existing?.autoProvision,
         groups: account.groups ?? existing?.groups,
         // 以下字段仅在已有配置值或显式传入时才写入，onboarding 时不主动生成
@@ -2395,22 +3068,28 @@ const wecomOnboardingAdapter = {
  */
 async function sendWeComMessage({ to, content, accountId, }) {
     const resolvedAccountId = accountId ?? DEFAULT_ACCOUNT_ID;
-    // 从 to 中提取 chatId（格式是 "${CHANNEL_ID}:chatId" 或直接是 chatId）
     const channelPrefix = new RegExp(`^${CHANNEL_ID}:`, "i");
     const chatId = to.replace(channelPrefix, "");
-    console.log(`[WeCom] sendWeComMessage: ${JSON.stringify({ to, content, accountId })}`);
+    logWeCom(runtime, "Sending outbound message", {
+        to,
+        accountId: resolvedAccountId,
+        textLength: String(content ?? "").length,
+    });
     // 获取 WSClient 实例
     const wsClient = getWeComWebSocket(resolvedAccountId);
     if (!wsClient) {
         throw new Error(`WSClient not connected for account ${resolvedAccountId}`);
     }
-    // 使用 SDK 的 sendMessage 主动发送 markdown 消息
     const result = await wsClient.sendMessage(chatId, {
         msgtype: 'markdown',
         markdown: { content },
     });
     const messageId = result?.headers?.req_id ?? `wecom-${Date.now()}`;
-    console.log(`[WeCom] Sent message to ${chatId}, messageId=${messageId}`);
+    logWeCom(runtime, "Outbound message sent", {
+        chatId,
+        accountId: resolvedAccountId,
+        messageId,
+    });
     return {
         channel: CHANNEL_ID,
         messageId,
@@ -2438,12 +3117,7 @@ const wecomPlugin = {
         idLabel: "wecomUserId",
         normalizeAllowEntry: (entry) => entry.replace(new RegExp(`^(${CHANNEL_ID}|user):`, "i"), "").trim(),
         notifyApproval: async ({ cfg, id }) => {
-            // sendWeComMessage({
-            //   to: id,
-            //   content: " pairing approved",
-            //   accountId: cfg.accountId,
-            // });
-            console.log(`[WeCom] Pairing approved for user: ${id}`);
+            logWeCom(runtime, "Pairing approved", { id, accountId: cfg.accountId });
         },
     },
     onboarding: wecomOnboardingAdapter,
@@ -2455,7 +3129,7 @@ const wecomPlugin = {
         nativeCommands: false,
         blockStreaming: true,
     },
-    reload: { configPrefixes: [`channels.${CHANNEL_ID}`, "agents", "bindings", "commands", "tools.elevated", "messages"] },
+    reload: { configPrefixes: [`channels.${CHANNEL_ID}`, "commands", "tools.elevated", "messages", "plugins.allow"] },
     config: {
         // 列出所有账户 ID（最小实现只支持默认账户）
         listAccountIds: () => [DEFAULT_ACCOUNT_ID],
@@ -2544,6 +3218,14 @@ const wecomPlugin = {
             if (groupPolicy === "open" && !(autoProvision.enabled && autoProvision.group.requireMention)) {
                 warnings.push(`- 企业微信群组：groupPolicy="open" 允许所有群组中的成员触发。设置 channels.${CHANNEL_ID}.groupPolicy="allowlist" + channels.${CHANNEL_ID}.groupAllowFrom 来限制群组。`);
             }
+            const allowedPlugins = Array.isArray(cfg.plugins?.allow) ? cfg.plugins.allow.map((entry) => String(entry)) : [];
+            if (!allowedPlugins.includes("wecom-openclaw-plugin")) {
+                warnings.push(`- plugins.allow 未显式包含 "wecom-openclaw-plugin"。建议设置 plugins.allow=["wecom-openclaw-plugin"]，避免插件白名单为空。`);
+            }
+            const approvalConfig = resolveWeComApprovalConfig(cfg);
+            if (approvalConfig.enabled && approvalConfig.notifyTo.length === 0) {
+                warnings.push(`- 企业微信执行审批已启用，但 channels.${CHANNEL_ID}.approvals.notifyTo 为空，也没有 ownerAllowFrom 回退；审批请求不会投递给管理员。`);
+            }
             return warnings;
         },
     },
@@ -2572,11 +3254,22 @@ const wecomPlugin = {
         chunker: (text, limit) => getWeComRuntime().channel.text.chunkMarkdownText(text, limit),
         textChunkLimit: TEXT_CHUNK_LIMIT,
         sendText: async ({ to, text, accountId, ...rest }) => {
-            console.log(`[WeCom] sendText: ${JSON.stringify({ to, text, accountId, ...rest })}`);
+            logWeCom(runtime, "sendText", {
+                to,
+                accountId: accountId ?? DEFAULT_ACCOUNT_ID,
+                textLength: String(text ?? "").length,
+                meta: rest,
+            });
             return sendWeComMessage({ to, content: text, accountId: accountId ?? undefined });
         },
         sendMedia: async ({ to, text, mediaUrl, accountId, ...rest }) => {
-            console.log(`[WeCom] sendMedia: ${JSON.stringify({ to, text, mediaUrl, accountId, ...rest })}`);
+            logWeCom(runtime, "sendMedia", {
+                to,
+                accountId: accountId ?? DEFAULT_ACCOUNT_ID,
+                textLength: String(text ?? "").length,
+                hasMediaUrl: Boolean(mediaUrl),
+                meta: rest,
+            });
             const content = `Sending attachments is not supported yet\n${text ? `${text}\n${mediaUrl}` : (mediaUrl ?? "")}`;
             return sendWeComMessage({ to, content, accountId: accountId ?? undefined });
         },
@@ -2640,6 +3333,8 @@ const wecomPlugin = {
                 accountId: ctx.account.accountId,
                 runtime: ctx.runtime,
             });
+            pruneWeComMediaStorage(cfg, ctx.runtime);
+            await primeApprovalWatcher(cfg, ctx.runtime);
             const account = resolveWeComAccount(cfg);
             // 启动 WebSocket 监听
             return monitorWeComProvider({
@@ -2685,7 +3380,7 @@ const wecomPlugin = {
 };
 
 const plugin = {
-    id: "wecom",
+    id: "wecom-openclaw-plugin",
     name: "企业微信",
     description: "企业微信 OpenClaw 插件",
     configSchema: wecomPluginConfigSchema,

@@ -97,8 +97,14 @@ const TEMPLATE_SEED_ENTRIES = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md"
 const autoProvisionInflight = new Map();
 const transcriptReadOffsets = new Map();
 const pendingApprovals = new Map();
+const approverPendingApprovalStacks = new Map();
 const sessionApprovalGates = new Map();
 const APPROVAL_DECISIONS = new Set(["allow-once", "allow-always", "deny"]);
+const APPROVAL_SHORTCUT_DECISIONS = new Map([
+    ["a", "allow-once"],
+    ["b", "allow-always"],
+    ["c", "deny"],
+]);
 const SENSITIVE_KEY_RE = /(secret|token|api[-_]?key|authorization|password)/i;
 let approvalTranscriptWatcherStop = null;
 function expandUserPath(value) {
@@ -333,6 +339,52 @@ function parseWeComApprovalCommand(text) {
         decision: match[2] ? match[2].toLowerCase() : "",
     };
 }
+function parseWeComApprovalShortcut(text) {
+    const trimmed = String(text ?? "").trim().toLowerCase();
+    return APPROVAL_SHORTCUT_DECISIONS.get(trimmed);
+}
+function rememberPendingApprovalForApprover(approver, approvalId) {
+    const key = normalizeOwnerEntry(approver);
+    if (!key || !approvalId) {
+        return;
+    }
+    const existing = approverPendingApprovalStacks.get(key) ?? [];
+    const next = existing.filter((entry) => entry !== approvalId);
+    next.push(approvalId);
+    approverPendingApprovalStacks.set(key, next);
+}
+function removePendingApprovalFromApprovers(approvalId) {
+    if (!approvalId) {
+        return;
+    }
+    for (const [approver, stack] of approverPendingApprovalStacks.entries()) {
+        const next = stack.filter((entry) => entry !== approvalId);
+        if (next.length > 0) {
+            approverPendingApprovalStacks.set(approver, next);
+        }
+        else {
+            approverPendingApprovalStacks.delete(approver);
+        }
+    }
+}
+function resolveLatestPendingApprovalForApprover(approver) {
+    const key = normalizeOwnerEntry(approver);
+    if (!key) {
+        return undefined;
+    }
+    const stack = approverPendingApprovalStacks.get(key) ?? [];
+    while (stack.length > 0) {
+        const approvalId = stack[stack.length - 1];
+        const approval = pendingApprovals.get(approvalId);
+        if (approval) {
+            approverPendingApprovalStacks.set(key, stack);
+            return approval;
+        }
+        stack.pop();
+    }
+    approverPendingApprovalStacks.delete(key);
+    return undefined;
+}
 function loadSessionStoreEntryForTranscript(sessionFile) {
     const storePath = path.join(path.dirname(sessionFile), "sessions.json");
     if (!pathExists(storePath)) {
@@ -396,16 +448,17 @@ async function sendApprovalNotificationToApprovers(params) {
     const commandPreview = truncateForLog(approval.command, 600);
     const requester = approval.deliveryContext?.to ?? approval.sessionKey;
     const content = [
-        "Exec approval required",
+        "执行审批请求",
         `Request ID: ${approval.slug}`,
         `Requester: ${requester}`,
         `Session: ${approval.sessionKey}`,
         approval.cwd ? `CWD: ${approval.cwd}` : undefined,
         `Command: ${commandPreview}`,
         "",
-        `Reply with: /approve ${approval.slug} allow-once`,
-        `Or: /approve ${approval.slug} allow-always`,
-        `Or: /approve ${approval.slug} deny`,
+        "请直接回复一个字母：",
+        "A = 允许一次",
+        "B = 始终允许",
+        "C = 拒绝",
     ].filter(Boolean).join("\n");
     for (const approver of approvalConfig.notifyTo) {
         try {
@@ -414,6 +467,7 @@ async function sendApprovalNotificationToApprovers(params) {
                 content,
                 accountId: approval.accountId,
             });
+            rememberPendingApprovalForApprover(approver, approval.id);
         }
         catch (err) {
             logWeComError(runtime, "Failed to send approval notification", {
@@ -486,6 +540,7 @@ function clearPendingApproval(approvalId) {
         clearTimeout(pending.timeoutHandle);
     }
     pendingApprovals.delete(approvalId);
+    removePendingApprovalFromApprovers(approvalId);
     if (pending?.sessionKey) {
         clearSessionApprovalGate(pending.sessionKey, approvalId);
     }
@@ -2454,8 +2509,9 @@ function formatPendingApprovalsSummary() {
     return rows.length > 0 ? rows.join("\n") : "当前没有待审批的执行请求。";
 }
 async function maybeHandleWeComApprovalCommand(params) {
+    const shortcutDecision = parseWeComApprovalShortcut(params.text);
     const parsed = parseWeComApprovalCommand(params.text);
-    if (!parsed) {
+    if (!parsed && !shortcutDecision) {
         return false;
     }
     const approvalConfig = resolveWeComApprovalConfig(params.cfg);
@@ -2486,11 +2542,52 @@ async function maybeHandleWeComApprovalCommand(params) {
         });
         return true;
     }
+    if (shortcutDecision) {
+        const pending = resolveLatestPendingApprovalForApprover(params.senderId);
+        if (!pending) {
+            await sendWeComReply({
+                wsClient: params.wsClient,
+                frame: params.frame,
+                text: "当前没有待审批的执行请求。",
+                runtime: params.runtime,
+            });
+            return true;
+        }
+        try {
+            await resolveApprovalViaGateway(pending.id, shortcutDecision, params.runtime);
+            clearPendingApproval(pending.id);
+            const shortcutLabel = params.text.trim().toUpperCase();
+            const requesterText = shortcutDecision === "deny"
+                ? `执行审批已拒绝。\nRequest ID: ${pending.slug}`
+                : `执行审批已批准，命令继续运行。\nRequest ID: ${pending.slug}`;
+            await notifyApprovalRequester(pending, requesterText);
+            await sendWeComReply({
+                wsClient: params.wsClient,
+                frame: params.frame,
+                text: `已选择 ${shortcutLabel}: ${pending.slug}`,
+                runtime: params.runtime,
+            });
+        }
+        catch (err) {
+            logWeComError(params.runtime, "Failed to resolve approval", {
+                approvalId: pending.id,
+                decision: shortcutDecision,
+                error: String(err),
+            });
+            await sendWeComReply({
+                wsClient: params.wsClient,
+                frame: params.frame,
+                text: `审批提交失败: ${pending.slug}\n${truncateForLog(String(err), 400)}`,
+                runtime: params.runtime,
+            });
+        }
+        return true;
+    }
     if (!parsed.id || !parsed.decision) {
         await sendWeComReply({
             wsClient: params.wsClient,
             frame: params.frame,
-            text: ["用法: /approve <id> allow-once|allow-always|deny", "", formatPendingApprovalsSummary()].join("\n"),
+            text: ["请直接回复 A / B / C。", "A = allow-once", "B = allow-always", "C = deny", "", formatPendingApprovalsSummary()].join("\n"),
             runtime: params.runtime,
         });
         return true;
@@ -2499,7 +2596,7 @@ async function maybeHandleWeComApprovalCommand(params) {
         await sendWeComReply({
             wsClient: params.wsClient,
             frame: params.frame,
-            text: "无效审批动作。可用值: allow-once, allow-always, deny。",
+            text: "无效审批动作。请直接回复 A / B / C。",
             runtime: params.runtime,
         });
         return true;

@@ -82,6 +82,8 @@ const DEFAULT_MEDIA_RETENTION_DAYS = 7;
 const DEFAULT_MEDIA_STORAGE_SUBDIR = CHANNEL_ID;
 /** 默认审批处理超时（毫秒） */
 const DEFAULT_APPROVAL_RESOLVE_TIMEOUT_MS = 15000;
+/** 审批完成回执保留时长（毫秒） */
+const DEFAULT_APPROVAL_COMPLETION_TRACK_TTL_MS = 10 * 60 * 1000;
 /** 文本分块大小上限 */
 const TEXT_CHUNK_LIMIT = 4000;
 const AUTO_PROVISION_REGISTRY_VERSION = 1;
@@ -97,6 +99,7 @@ const TEMPLATE_SEED_ENTRIES = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md"
 const autoProvisionInflight = new Map();
 const transcriptReadOffsets = new Map();
 const pendingApprovals = new Map();
+const resolvedApprovalsAwaitingCompletion = new Map();
 const approverPendingApprovalStacks = new Map();
 const sessionApprovalGates = new Map();
 const APPROVAL_DECISIONS = new Set(["allow-once", "allow-always", "deny"]);
@@ -497,6 +500,37 @@ async function notifyApprovalRequester(approval, content) {
         });
     }
 }
+function rememberResolvedApprovalAwaitingCompletion(approval) {
+    if (!approval?.id) {
+        return;
+    }
+    const existing = resolvedApprovalsAwaitingCompletion.get(approval.id);
+    if (existing?.timeoutHandle) {
+        clearTimeout(existing.timeoutHandle);
+    }
+    resolvedApprovalsAwaitingCompletion.set(approval.id, {
+        ...approval,
+        resolvedAtMs: Date.now(),
+        timeoutHandle: setTimeout(() => {
+            clearResolvedApprovalAwaitingCompletion(approval.id);
+        }, DEFAULT_APPROVAL_COMPLETION_TRACK_TTL_MS),
+    });
+}
+function clearResolvedApprovalAwaitingCompletion(approvalId) {
+    const existing = resolvedApprovalsAwaitingCompletion.get(approvalId);
+    if (existing?.timeoutHandle) {
+        clearTimeout(existing.timeoutHandle);
+    }
+    resolvedApprovalsAwaitingCompletion.delete(approvalId);
+    return existing;
+}
+async function notifyApprovalCompletion(approval, exitCode) {
+    const success = Number(exitCode) === 0;
+    const content = success
+        ? `执行已完成，原任务继续整理结果。\nRequest ID: ${approval.slug}`
+        : `执行已完成（退出码 ${String(exitCode)}），原任务继续根据结果处理。\nRequest ID: ${approval.slug}`;
+    await notifyApprovalRequester(approval, content);
+}
 function getSessionApprovalGate(sessionKey) {
     const key = String(sessionKey ?? "").trim();
     if (!key) {
@@ -552,6 +586,13 @@ async function handlePendingApprovalExpiry(approvalId) {
         return;
     }
     await notifyApprovalRequester(pending, `执行审批已超时，未运行。\nRequest ID: ${pending.slug}`);
+}
+async function handleApprovalFinishedTranscriptEntry(approvalId, exitCode) {
+    const approval = clearResolvedApprovalAwaitingCompletion(approvalId) ?? clearPendingApproval(approvalId);
+    if (!approval) {
+        return;
+    }
+    await notifyApprovalCompletion(approval, exitCode);
 }
 async function handleApprovalTranscriptEntry(transcriptEntry, sessionInfo, cfg, runtime) {
     const message = transcriptEntry?.message;
@@ -612,6 +653,12 @@ async function handleTranscriptUpdate(sessionFile) {
             const idMatch = text.match(/gateway id=([a-f0-9-]{8,})/i);
             if (timeoutMatch && idMatch) {
                 clearPendingApproval(idMatch[1]);
+                clearResolvedApprovalAwaitingCompletion(idMatch[1]);
+                continue;
+            }
+            const finishedMatch = text.match(/Exec finished \(gateway id=([a-f0-9-]{8,}), session=[^,]+, code (-?\d+)\)/i);
+            if (finishedMatch) {
+                await handleApprovalFinishedTranscriptEntry(finishedMatch[1], Number(finishedMatch[2]));
             }
         }
     }
@@ -2555,11 +2602,14 @@ async function maybeHandleWeComApprovalCommand(params) {
         }
         try {
             await resolveApprovalViaGateway(pending.id, shortcutDecision, params.runtime);
-            clearPendingApproval(pending.id);
+            const resolvedApproval = clearPendingApproval(pending.id) ?? pending;
+            if (shortcutDecision !== "deny") {
+                rememberResolvedApprovalAwaitingCompletion(resolvedApproval);
+            }
             const shortcutLabel = params.text.trim().toUpperCase();
             const requesterText = shortcutDecision === "deny"
                 ? `执行审批已拒绝。\nRequest ID: ${pending.slug}`
-                : `执行审批已批准，命令继续运行。\nRequest ID: ${pending.slug}`;
+                : `执行审批已批准，等待执行完成。\nRequest ID: ${pending.slug}`;
             await notifyApprovalRequester(pending, requesterText);
             await sendWeComReply({
                 wsClient: params.wsClient,
@@ -2613,10 +2663,13 @@ async function maybeHandleWeComApprovalCommand(params) {
     }
     try {
         await resolveApprovalViaGateway(pending.id, parsed.decision, params.runtime);
-        clearPendingApproval(pending.id);
+        const resolvedApproval = clearPendingApproval(pending.id) ?? pending;
+        if (parsed.decision !== "deny") {
+            rememberResolvedApprovalAwaitingCompletion(resolvedApproval);
+        }
         const requesterText = parsed.decision === "deny"
             ? `执行审批已拒绝。\nRequest ID: ${pending.slug}`
-            : `执行审批已批准，命令继续运行。\nRequest ID: ${pending.slug}`;
+            : `执行审批已批准，等待执行完成。\nRequest ID: ${pending.slug}`;
         await notifyApprovalRequester(pending, requesterText);
         await sendWeComReply({
             wsClient: params.wsClient,

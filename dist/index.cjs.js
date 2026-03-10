@@ -2597,6 +2597,19 @@ async function maybeHandleWeComApprovalCommand(params) {
         return true;
     }
     if (shortcutDecision) {
+        if (!params.senderId) {
+            logWeComError(params.runtime, "Approval shortcut missing senderId", {
+                text: params.text,
+                chatType: params.chatType,
+            });
+            await sendWeComReply({
+                wsClient: params.wsClient,
+                frame: params.frame,
+                text: "当前无法识别审批人，请改用 /approve <id> <action>。",
+                runtime: params.runtime,
+            });
+            return true;
+        }
         const pending = resolveLatestPendingApprovalForApprover(params.senderId);
         if (!pending) {
             await sendWeComReply({
@@ -2790,6 +2803,7 @@ async function processWeComMessage(params) {
         wsClient,
         frame,
         chatType,
+        senderId: body.from.userid,
         commandAccess: preflightCommandAccess,
     })) {
         return effectiveConfig;

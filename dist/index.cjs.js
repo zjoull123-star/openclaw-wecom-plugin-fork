@@ -104,6 +104,7 @@ const TEMPLATE_SEED_ENTRIES = ["AGENTS.md", "SOUL.md", "TOOLS.md", "IDENTITY.md"
 const autoProvisionInflight = new Map();
 const transcriptReadOffsets = new Map();
 const pendingApprovals = new Map();
+const sessionApprovalGates = new Map();
 const APPROVAL_DECISIONS = new Set(["allow-once", "allow-always", "deny"]);
 const SENSITIVE_KEY_RE = /(secret|token|api[-_]?key|authorization|password)/i;
 let approvalTranscriptWatcherStop = null;
@@ -449,12 +450,52 @@ async function notifyApprovalRequester(approval, content) {
         });
     }
 }
+function getSessionApprovalGate(sessionKey) {
+    const key = String(sessionKey ?? "").trim();
+    if (!key) {
+        return undefined;
+    }
+    return sessionApprovalGates.get(key);
+}
+function setSessionApprovalGate(sessionKey, approval) {
+    const key = String(sessionKey ?? "").trim();
+    if (!key || !(approval === null || approval === void 0 ? void 0 : approval.id)) {
+        return;
+    }
+    sessionApprovalGates.set(key, {
+        approvalId: approval.id,
+        slug: approval.slug,
+        createdAtMs: Date.now(),
+    });
+}
+function clearSessionApprovalGate(sessionKey, approvalId) {
+    const key = String(sessionKey ?? "").trim();
+    if (!key) {
+        return;
+    }
+    const gate = sessionApprovalGates.get(key);
+    if (!gate) {
+        return;
+    }
+    if (!approvalId || gate.approvalId === approvalId) {
+        sessionApprovalGates.delete(key);
+    }
+}
+function buildApprovalPendingPlaceholder(gate) {
+    return [
+        "执行已暂停，等待管理员审批。",
+        (gate === null || gate === void 0 ? void 0 : gate.slug) ? `Request ID: ${gate.slug}` : undefined,
+    ].filter(Boolean).join("\n");
+}
 function clearPendingApproval(approvalId) {
     const pending = pendingApprovals.get(approvalId);
     if (pending?.timeoutHandle) {
         clearTimeout(pending.timeoutHandle);
     }
     pendingApprovals.delete(approvalId);
+    if (pending?.sessionKey) {
+        clearSessionApprovalGate(pending.sessionKey, approvalId);
+    }
     return pending;
 }
 async function handlePendingApprovalExpiry(approvalId) {
@@ -489,6 +530,7 @@ async function handleApprovalTranscriptEntry(transcriptEntry, sessionInfo, cfg, 
         }, Math.max(0, expiresAtMs - Date.now())),
     };
     pendingApprovals.set(approvalId, approval);
+    setSessionApprovalGate(approval.sessionKey, approval);
     await sendApprovalNotificationToApprovers({ approval, cfg, runtime });
 }
 async function handleTranscriptUpdate(sessionFile) {
@@ -2345,6 +2387,23 @@ async function routeAndDispatchMessage(params) {
             cfg: config,
             dispatcherOptions: {
                 deliver: async (payload, info) => {
+                    const approvalGate = getSessionApprovalGate(ctxPayload.SessionKey);
+                    if (approvalGate) {
+                        if (state.pendingApprovalId !== approvalGate.approvalId) {
+                            state.pendingApprovalId = approvalGate.approvalId;
+                            state.pendingApprovalPlaceholder = buildApprovalPendingPlaceholder(approvalGate);
+                            state.accumulatedText = "";
+                            await sendWeComReply({
+                                wsClient,
+                                frame,
+                                text: state.pendingApprovalPlaceholder,
+                                runtime,
+                                finish: false,
+                                streamId: state.streamId,
+                            });
+                        }
+                        return;
+                    }
                     state.accumulatedText += payload.text;
                     if (info.kind !== "final") {
                         await sendWeComReply({
@@ -2364,11 +2423,12 @@ async function routeAndDispatchMessage(params) {
             },
         });
         // 发送最终消息
-        if (state.accumulatedText) {
+        const finalText = state.accumulatedText || state.pendingApprovalPlaceholder;
+        if (finalText) {
             await sendWeComReply({
                 wsClient,
                 frame,
-                text: state.accumulatedText,
+                text: finalText,
                 runtime,
                 finish: true,
                 streamId: state.streamId,
@@ -2652,7 +2712,12 @@ async function processWeComMessage(params) {
     // Step 5: 初始化消息状态
     setReqIdForChat(chatId, reqId, effectiveAccount.accountId);
     const streamId = generateReqId("stream");
-    const state = { accumulatedText: "", streamId };
+    const state = {
+        accumulatedText: "",
+        streamId,
+        pendingApprovalId: "",
+        pendingApprovalPlaceholder: "",
+    };
     setMessageState(messageId, state);
     const cleanupState = () => {
         deleteMessageState(messageId);

@@ -170,3 +170,34 @@ When a WeCom session triggers an exec approval:
 
 - Approval delivery depends on the gateway CLI being available to the plugin runtime for `openclaw gateway call exec.approval.resolve`.
 - This fork is maintained from packaged `dist/` artifacts rather than the upstream source tree.
+
+## Managed Hooks
+
+This repo also versions the WeCom-specific managed hooks used in the live deployment:
+
+```text
+hooks/wecom-agent-memory
+hooks/memory-path-guard
+```
+
+They are not loaded by the plugin package automatically. Install or update them by copying the directories into `~/.openclaw/hooks`:
+
+```sh
+mkdir -p ~/.openclaw/hooks
+rsync -av hooks/wecom-agent-memory/ ~/.openclaw/hooks/wecom-agent-memory/
+rsync -av hooks/memory-path-guard/ ~/.openclaw/hooks/memory-path-guard/
+openclaw config validate
+openclaw gateway restart
+```
+
+What they do:
+
+- `wecom-agent-memory`: system-managed long-term memory for WeCom DM/group agents, with structured files under each workspace `memory/`
+- `memory-path-guard`: blocks model tool calls from writing directly into `memory/`; temporary notes should go under `notes/`
+
+Useful diagnostics:
+
+```sh
+node hooks/wecom-agent-memory/diagnose.js <agentId>
+openclaw memory status --agent <agentId> --json
+```

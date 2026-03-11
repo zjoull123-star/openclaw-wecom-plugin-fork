@@ -338,6 +338,121 @@ function resolveWeComApprovalConfig(cfg) {
         dmOnly: raw.dmOnly !== false,
     };
 }
+function resolveWeComElevatedAutoAllowList(cfg) {
+    const raw = cfg.tools?.elevated?.autoAllowFrom?.[CHANNEL_ID];
+    if (!Array.isArray(raw)) {
+        return [];
+    }
+    return Array.from(new Set(raw.map((entry) => String(entry).trim()).filter(Boolean)));
+}
+function resolveWeComDirectBindingAgentId(cfg, accountId, senderId) {
+    const normalizedSenderId = normalizeStringEntry(senderId);
+    if (!normalizedSenderId) {
+        return undefined;
+    }
+    const normalizedAccountId = normalizeStringEntry(accountId) ?? DEFAULT_ACCOUNT_ID;
+    for (const binding of cfg.bindings ?? []) {
+        if (binding?.match?.channel !== CHANNEL_ID) {
+            continue;
+        }
+        const peer = binding?.match?.peer;
+        if (peer?.kind !== "direct" || String(peer?.id ?? "").trim() !== normalizedSenderId) {
+            continue;
+        }
+        const bindingAccountId = normalizeStringEntry(binding?.match?.accountId) ?? DEFAULT_ACCOUNT_ID;
+        if (bindingAccountId !== normalizedAccountId) {
+            continue;
+        }
+        const agentId = normalizeStringEntry(binding?.agentId);
+        if (agentId) {
+            return agentId;
+        }
+    }
+    return undefined;
+}
+function resolveAgentSessionsStorePath(cfg, agentId) {
+    const normalizedAgentId = normalizeStringEntry(agentId);
+    if (!normalizedAgentId) {
+        return undefined;
+    }
+    const agent = (cfg.agents?.list ?? []).find((entry) => normalizeStringEntry(entry?.id) === normalizedAgentId);
+    const agentDir = normalizeStringEntry(agent?.agentDir);
+    if (!agentDir) {
+        return undefined;
+    }
+    return path.join(path.dirname(expandUserPath(agentDir)), "sessions", "sessions.json");
+}
+async function ensureSessionStoreElevatedFull(storePath, sessionKey, deliveryContext, runtime) {
+    if (!storePath || !pathExists(storePath)) {
+        return false;
+    }
+    return await withFileLock(storePath, DEFAULT_LOCK_OPTIONS, async () => {
+        const { value } = await readJsonFileWithFallback(storePath, {});
+        const store = value && typeof value === "object" && !Array.isArray(value) ? { ...value } : {};
+        const current = store?.[sessionKey];
+        if (!current || typeof current !== "object") {
+            logWeCom(runtime, "Auto-allow session sync skipped; session entry missing", { storePath, sessionKey });
+            return false;
+        }
+        const nextEntry = {
+            ...current,
+            elevatedLevel: "full",
+            updatedAt: Date.now(),
+            deliveryContext: current.deliveryContext ?? deliveryContext,
+            lastChannel: current.lastChannel ?? deliveryContext?.channel,
+            lastTo: current.lastTo ?? deliveryContext?.to,
+            lastAccountId: current.lastAccountId ?? deliveryContext?.accountId,
+        };
+        const changed = current.elevatedLevel !== "full" || current.lastTo !== nextEntry.lastTo || current.lastChannel !== nextEntry.lastChannel || current.lastAccountId !== nextEntry.lastAccountId || current.deliveryContext !== nextEntry.deliveryContext;
+        if (!changed) {
+            return false;
+        }
+        store[sessionKey] = nextEntry;
+        await writeJsonFileAtomically(storePath, store);
+        return true;
+    });
+}
+async function ensureWeComAutoAllowSession(params) {
+    const { cfg, runtime, accountId, senderId } = params;
+    const normalizedSenderId = normalizeStringEntry(senderId);
+    if (!normalizedSenderId) {
+        return false;
+    }
+    const autoAllowList = resolveWeComElevatedAutoAllowList(cfg);
+    if (!autoAllowList.includes(normalizedSenderId)) {
+        return false;
+    }
+    const agentId = resolveWeComDirectBindingAgentId(cfg, accountId, normalizedSenderId);
+    if (agentId !== "main") {
+        return false;
+    }
+    const storePath = resolveAgentSessionsStorePath(cfg, agentId);
+    const deliveryContext = {
+        channel: CHANNEL_ID,
+        to: CHANNEL_ID + ":" + normalizedSenderId,
+        accountId: normalizeStringEntry(accountId) ?? DEFAULT_ACCOUNT_ID,
+    };
+    const updated = await ensureSessionStoreElevatedFull(storePath, "agent:" + agentId + ":main", deliveryContext, runtime);
+    if (updated) {
+        logWeCom(runtime, "Persisted auto-allow elevated level for WeCom main session", {
+            senderId: normalizedSenderId,
+            agentId,
+            storePath,
+        });
+    }
+    return updated;
+}
+async function syncWeComAutoAllowSessions(cfg, runtime, accountId = DEFAULT_ACCOUNT_ID) {
+    const autoAllowList = resolveWeComElevatedAutoAllowList(cfg);
+    for (const senderId of autoAllowList) {
+        await ensureWeComAutoAllowSession({
+            cfg,
+            runtime,
+            accountId,
+            senderId,
+        });
+    }
+}
 function parseWeComApprovalCommand(text) {
     const trimmed = String(text ?? "").trim();
     const match = trimmed.match(/^\/approve(?:\s+([A-Za-z0-9-]+)(?:\s+(allow-once|allow-always|deny))?)?\s*$/i);
@@ -1134,6 +1249,15 @@ function ensureProvisionedFilesystem(params) {
     }
     return false;
 }
+function ensureWeComAgentMemorySearch(memorySearch) {
+    return {
+        ...(memorySearch ?? {}),
+        query: {
+            ...(memorySearch?.query ?? {}),
+            minScore: 0,
+        },
+    };
+}
 function ensureProvisionedAgentConfig(cfg, params) {
     const { entry, kind, accountId, autoProvision } = params;
     let nextCfg = cfg;
@@ -1160,6 +1284,7 @@ function ensureProvisionedAgentConfig(cfg, params) {
         name: existingAgent?.name ?? desiredName,
         workspace: existingAgent?.workspace ?? entry.workspace,
         agentDir: existingAgent?.agentDir ?? entry.agentDir,
+        memorySearch: ensureWeComAgentMemorySearch(existingAgent?.memorySearch),
     };
     if (kind === AUTO_PROVISION_GROUP_KIND) {
         nextAgent.groupChat = {
@@ -3104,6 +3229,17 @@ const wecomPluginConfigSchema = {
                 dmOnly: { type: "boolean" },
             },
         },
+        memory: {
+            type: "object",
+            additionalProperties: true,
+            properties: {
+                enabled: { type: "boolean" },
+                tailWindowMessages: { type: "number" },
+                indexDebounceMs: { type: "number" },
+                protectMemoryDir: { type: "boolean" },
+                groupMode: { type: "string" },
+            },
+        },
         autoProvision: {
             type: "object",
             additionalProperties: true,
@@ -3570,6 +3706,7 @@ const wecomPlugin = {
                 runtime: ctx.runtime,
             });
             pruneWeComMediaStorage(cfg, ctx.runtime);
+            await syncWeComAutoAllowSessions(cfg, ctx.runtime, ctx.account.accountId);
             await primeApprovalWatcher(cfg, ctx.runtime);
             const account = resolveWeComAccount(cfg);
             // 启动 WebSocket 监听

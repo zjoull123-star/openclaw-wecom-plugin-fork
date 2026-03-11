@@ -7,29 +7,62 @@
     "type": "object",
     "additionalProperties": true,
     "properties": {
-      "enabled": { "type": "boolean" },
-      "name": { "type": "string" },
-      "websocketUrl": { "type": "string" },
-      "botId": { "type": "string" },
-      "secret": { "type": "string" },
-      "sendThinkingMessage": { "type": "boolean" },
+      "enabled": {
+        "type": "boolean"
+      },
+      "name": {
+        "type": "string"
+      },
+      "websocketUrl": {
+        "type": "string"
+      },
+      "botId": {
+        "type": "string"
+      },
+      "secret": {
+        "type": "string"
+      },
+      "sendThinkingMessage": {
+        "type": "boolean"
+      },
       "allowFrom": {
         "type": "array",
-        "items": { "type": ["string", "number"] }
+        "items": {
+          "type": [
+            "string",
+            "number"
+          ]
+        }
       },
       "dmPolicy": {
         "type": "string",
-        "enum": ["disabled", "open", "pairing", "allowlist"]
+        "enum": [
+          "disabled",
+          "open",
+          "pairing",
+          "allowlist"
+        ]
       },
       "groupPolicy": {
         "type": "string",
-        "enum": ["disabled", "open", "allowlist"]
+        "enum": [
+          "disabled",
+          "open",
+          "allowlist"
+        ]
       },
       "groupAllowFrom": {
         "type": "array",
-        "items": { "type": ["string", "number"] }
+        "items": {
+          "type": [
+            "string",
+            "number"
+          ]
+        }
       },
-      "configWrites": { "type": "boolean" },
+      "configWrites": {
+        "type": "boolean"
+      },
       "groups": {
         "type": "object",
         "additionalProperties": true
@@ -38,46 +71,98 @@
         "type": "object",
         "additionalProperties": true,
         "properties": {
-          "maxMb": { "type": "number" },
-          "retentionDays": { "type": "number" },
-          "storageDir": { "type": "string" }
+          "maxMb": {
+            "type": "number"
+          },
+          "retentionDays": {
+            "type": "number"
+          },
+          "storageDir": {
+            "type": "string"
+          }
         }
       },
       "approvals": {
         "type": "object",
         "additionalProperties": true,
         "properties": {
-          "enabled": { "type": "boolean" },
+          "enabled": {
+            "type": "boolean"
+          },
           "notifyTo": {
             "type": "array",
-            "items": { "type": ["string", "number"] }
+            "items": {
+              "type": [
+                "string",
+                "number"
+              ]
+            }
           },
-          "dmOnly": { "type": "boolean" }
+          "dmOnly": {
+            "type": "boolean"
+          }
         }
       },
       "autoProvision": {
         "type": "object",
         "additionalProperties": true,
         "properties": {
-          "enabled": { "type": "boolean" },
-          "registryPath": { "type": "string" },
-          "templateDir": { "type": "string" },
+          "enabled": {
+            "type": "boolean"
+          },
+          "registryPath": {
+            "type": "string"
+          },
+          "templateDir": {
+            "type": "string"
+          },
           "dm": {
             "type": "object",
             "additionalProperties": true,
             "properties": {
-              "agentIdPrefix": { "type": "string" },
-              "workspaceRoot": { "type": "string" }
+              "agentIdPrefix": {
+                "type": "string"
+              },
+              "workspaceRoot": {
+                "type": "string"
+              }
             }
           },
           "group": {
             "type": "object",
             "additionalProperties": true,
             "properties": {
-              "agentIdPrefix": { "type": "string" },
-              "workspaceRoot": { "type": "string" },
-              "requireMention": { "type": "boolean" }
+              "agentIdPrefix": {
+                "type": "string"
+              },
+              "workspaceRoot": {
+                "type": "string"
+              },
+              "requireMention": {
+                "type": "boolean"
+              }
             }
+          }
+        }
+      },
+      "memory": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "tailWindowMessages": {
+            "type": "number"
+          },
+          "indexDebounceMs": {
+            "type": "number"
+          },
+          "protectMemoryDir": {
+            "type": "boolean"
+          },
+          "groupMode": {
+            "type": "string"
           }
         }
       }
